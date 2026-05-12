@@ -48,6 +48,12 @@ type Conn struct {
 	connDeadlines
 	latencies []time.Duration
 
+	// LEDBAT / Congestion Control
+	cwnd            uint32
+	minDelay        uint32
+	lastDelayUpdate time.Time
+	lastDecrease    time.Time
+
 	// We need to send state packet.
 	pendingSendState              bool
 	sendPendingSendSendStateTimer *time.Timer
@@ -115,6 +121,14 @@ func (c *Conn) makePacket(_type st, connID, seqNr uint16, payload []byte) (p []b
 		TimestampDiff: c.lastTimeDiff,
 	}
 	if len(selAck.Bytes) != 0 {
+		// Ограничиваем размер маски Selective ACK, чтобы заголовок не превышал maxHeaderSize.
+		// Это необходимо, так как мы увеличили maxUnackedInbound до 4096, но хотим сохранить
+		// совместимый размер заголовка.
+		maxSelAckBytes := ((256+7)/8 + 3) / 4 * 4
+		if len(selAck.Bytes) > maxSelAckBytes {
+			selAck.Bytes = selAck.Bytes[:maxSelAckBytes]
+		}
+
 		// The spec requires the number of bytes for a selective ACK to be at
 		// least 4, and a multiple of 4.
 		if len(selAck.Bytes)%4 != 0 {
@@ -321,7 +335,30 @@ func (c *Conn) ackSkipped(seqNr uint16) {
 		return
 	}
 	switch send.acksSkipped {
-	case 3, 60:
+	case 3:
+		// Первый признак пропуска - режем осторожно (на 15%)
+		// и не чаще чем раз в один пинг (RTT)
+		if time.Since(c.lastDecrease) > c.latency() {
+			if c.cwnd > 14000 {
+				c.cwnd = uint32(float64(c.cwnd) * 0.85)
+				c.updateCanWrite()
+			}
+			c.lastDecrease = time.Now()
+		}
+
+		ackSkippedResends.Add(1)
+		send.resend()
+		send.resendTimer.Reset(c.resendTimeout() * time.Duration(send.numResends))
+	case 60:
+		// Если пакет потерян окончательно - режем сильнее (на 30%)
+		if time.Since(c.lastDecrease) > c.latency()/2 {
+			if c.cwnd > 14000 {
+				c.cwnd = uint32(float64(c.cwnd) * 0.7)
+				c.updateCanWrite()
+			}
+			c.lastDecrease = time.Now()
+		}
+
 		ackSkippedResends.Add(1)
 		send.resend()
 		send.resendTimer.Reset(c.resendTimeout() * time.Duration(send.numResends))
@@ -408,6 +445,56 @@ func (c *Conn) processDelivery(h header, payload []byte) {
 
 func (c *Conn) applyAcks(h header) {
 	c.ackTo(h.AckNr)
+
+	// LEDBAT: Обновляем minDelay и cwnd на основе TimestampDiff
+	if h.TimestampDiff != 0 {
+		if c.minDelay == 0 || h.TimestampDiff < c.minDelay {
+			c.minDelay = h.TimestampDiff
+		}
+
+		queuingDelay := h.TimestampDiff - c.minDelay
+		const targetDelay = 400000 // 400ms - "Бесстрашный" таргет (был 250ms)
+		const gain = 4.0           // Максимальный напор (был 2.0)
+		const maxCwnd = 4096 * 1400 // Соответствует новому лимиту в utp.go
+
+		if c.cwnd == 0 {
+			c.cwnd = 14000 // Стартуем сразу с 10 пакетов для быстрого разгона
+		}
+
+		offTarget := float64(targetDelay) - float64(queuingDelay)
+		windowFactor := float64(maxPayloadSize) / float64(c.cwnd)
+
+		// Адаптивный разгон: если окно маленькое (< 1000 пакетов) 
+		// и задержка почти нулевая, растем в 2 раза агрессивнее
+		currentGain := gain
+		if c.cwnd < 1000*1400 && queuingDelay < 50000 {
+			currentGain *= 2.0
+		}
+
+		// Если мы выше таргета (задержка большая), уменьшаем окно плавнее,
+		// чтобы не терять скорость на кратковременных всплесках
+		if offTarget < 0 {
+			currentGain = currentGain / 4.0
+		}
+
+		inc := currentGain * offTarget / float64(targetDelay) * windowFactor * float64(maxPayloadSize)
+
+		newCwnd := float64(c.cwnd) + inc
+		if newCwnd < 3000 {
+			newCwnd = 3000
+		}
+		if newCwnd > maxCwnd {
+			newCwnd = maxCwnd
+		}
+		c.cwnd = uint32(newCwnd)
+
+		// Раз в минуту сбрасываем minDelay для адаптации к изменению маршрута
+		if time.Since(c.lastDelayUpdate) > time.Minute {
+			c.minDelay = h.TimestampDiff
+			c.lastDelayUpdate = time.Now()
+		}
+	}
+
 	for _, ext := range h.Extensions {
 		switch ext.Type {
 		case extensionTypeSelectiveAck:
@@ -562,7 +649,7 @@ func (c *Conn) String() string {
 
 func (c *Conn) updateCanWrite() {
 	c.canWrite.SetBool(c.synAcked &&
-		len(c.unackedSends) < maxUnackedSends &&
+		len(c.unackedSends) < int(c.cwnd/1400+1) &&
 		c.cur_window <= c.peerWndSize)
 }
 

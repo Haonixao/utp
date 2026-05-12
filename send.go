@@ -55,6 +55,16 @@ func (s *send) timeoutResend() {
 	if s.acked.IsSet() || s.conn.destroyed.IsSet() {
 		return
 	}
+
+	// Жесткий таймаут - режем окно на 30% (вместо 50%)
+	if time.Since(s.conn.lastDecrease) > s.conn.latency() {
+		if s.conn.cwnd > 14000 {
+			s.conn.cwnd = uint32(float64(s.conn.cwnd) * 0.7)
+			s.conn.updateCanWrite()
+		}
+		s.conn.lastDecrease = time.Now()
+	}
+
 	rt := s.conn.resendTimeout()
 	s.resend()
 	s.numResends++

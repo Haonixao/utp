@@ -34,15 +34,15 @@ const (
 	minMTU = 1438 // Why?
 	// uTP header of 20, +2 for the next extension, and an optional selective
 	// ACK.
-	maxHeaderSize  = 20 + 2 + (((maxUnackedInbound+7)/8)+3)/4*4
+	maxHeaderSize  = 20 + 2 + (((256+7)/8)+3)/4*4
 	maxPayloadSize = minMTU - maxHeaderSize
 	maxRecvSize    = 0x2000
 
 	// Maximum out-of-order packets to buffer.
-	maxUnackedInbound = 256
-	maxUnackedSends   = 256
+	maxUnackedInbound = 4096
+	maxUnackedSends   = 4096
 
-	readBufferLen = 1 << 20 // ~1MiB
+	readBufferLen = 16 * 1024 * 1024 // 16MiB
 
 	// How long to wait before sending a state packet, after one is required.
 	// This prevents spamming a state packet for every packet received, and
