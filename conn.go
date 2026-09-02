@@ -12,6 +12,12 @@ import (
 	"github.com/anacrolix/missinggo"
 )
 
+// BBR constants
+const (
+	bbrCwndGain  = 2.0  // BBR cwnd gain (like cwnd_gain in BBR)
+	bbrRttWindow = 10   // 10 seconds for RTprop window
+)
+
 // Conn is a uTP stream and implements net.Conn. It owned by a Socket, which
 // handles dispatching packets to and from Conns.
 type Conn struct {
@@ -54,6 +60,15 @@ type Conn struct {
 	minDelay        uint32
 	lastDelayUpdate time.Time
 	lastDecrease    time.Time
+
+	// BBR-style state
+	rtpropMin            uint32     // Minimum RTT observed (microseconds)
+	rtpropExpire        time.Time  // When to reset rtpropMin (10 sec window)
+	btlbwMax            float64    // Maximum bandwidth observed (bytes/sec)
+	lastDeliveryTime    time.Time  // Last ACK arrival time for delivery rate
+	lastDelivered       uint32     // Bytes acked since last measurement
+	deliverySampleCount int        // Count of delivery rate samples for BtlBw window
+	packetSize         uint32     // Average packet size for rate estimation
 
 	// We need to send state packet.
 	pendingSendState              bool
@@ -194,7 +209,6 @@ func (c *Conn) pendSendState() {
 
 func (me *Conn) writeSyn() {
 	me.write(stSyn, me.recv_id, nil, me.seq_nr)
-	return
 }
 
 func (c *Conn) write(_type st, connID uint16, payload []byte, seqNr uint16) (n int, err error) {
@@ -429,53 +443,78 @@ func (c *Conn) processDelivery(h header, payload []byte) {
 func (c *Conn) applyAcks(h header) {
 	c.ackTo(h.AckNr)
 
-	// LEDBAT: Обновляем minDelay и cwnd на основе TimestampDiff
-	if h.TimestampDiff != 0 {
-		if c.minDelay == 0 || h.TimestampDiff < c.minDelay {
-			c.minDelay = h.TimestampDiff
+	// Calculate RTT from peer's timestamp
+	rtt := c.timestamp() - h.Timestamp
+
+	// Initialize BBR state on first RTT measurement
+	if c.cwnd == 0 {
+		c.cwnd = 14000 // Start with ~10 packets for fast ramp-up
+	}
+	if c.rtpropExpire.IsZero() {
+		c.rtpropExpire = time.Now().Add(time.Duration(bbrRttWindow) * time.Second)
+	}
+
+	// Update rtprop_min (minimum RTT) with 10-second window
+	if rtt > 0 {
+		if c.rtpropMin == 0 || rtt < c.rtpropMin {
+			c.rtpropMin = rtt
+		}
+		// Reset rtprop_min every 10 seconds to adapt to route changes
+		if time.Now().After(c.rtpropExpire) {
+			c.rtpropMin = rtt
+			c.rtpropExpire = time.Now().Add(time.Duration(bbrRttWindow) * time.Second)
+		}
+	}
+
+	// Calculate delivery rate (BBR-style)
+	now := time.Now()
+	bytesAcked := c.cur_window // Approximate bytes acknowledged
+	if c.lastDeliveryTime.IsZero() {
+		c.lastDeliveryTime = now
+		c.lastDelivered = 0
+	} else {
+		elapsed := now.Sub(c.lastDeliveryTime)
+		if elapsed > 0 {
+			// Current delivery rate: bytes / time
+			currentRate := float64(bytesAcked) / elapsed.Seconds()
+
+			// Update average packet size
+			if c.packetSize == 0 && bytesAcked > 0 {
+				c.packetSize = bytesAcked
+			} else if bytesAcked > 0 {
+				c.packetSize = (c.packetSize + bytesAcked) / 2
+			}
+
+			// Use exponential moving average for smoother bandwidth estimate
+			if c.btlbwMax == 0 {
+				c.btlbwMax = currentRate
+			} else {
+				// Weight recent measurement more heavily
+				c.btlbwMax = 0.7*c.btlbwMax + 0.3*currentRate
+			}
+
+			c.deliverySampleCount++
+			c.lastDeliveryTime = now
+			c.lastDelivered = 0
+		}
+	}
+
+	// BBR-style cwnd calculation: cwnd = cwnd_gain * BtlBw * RTprop
+	// BtlBw is in bytes/sec, RTprop in seconds
+	if c.rtpropMin > 0 && c.btlbwMax > 0 {
+		rtpropSec := float64(c.rtpropMin) / 1e6 // Convert microseconds to seconds
+		targetCwnd := bbrCwndGain * c.btlbwMax * rtpropSec
+
+		// Apply bounds
+		const maxCwnd = 4096 * 1400 // Match our max window
+		if targetCwnd < 3000 {
+			targetCwnd = 3000
+		}
+		if targetCwnd > maxCwnd {
+			targetCwnd = maxCwnd
 		}
 
-		queuingDelay := h.TimestampDiff - c.minDelay
-		const targetDelay = 400000 // 400ms - "Бесстрашный" таргет (был 250ms)
-		const gain = 4.0           // Максимальный напор (был 2.0)
-		const maxCwnd = 4096 * 1400 // Соответствует новому лимиту в utp.go
-
-		if c.cwnd == 0 {
-			c.cwnd = 14000 // Стартуем сразу с 10 пакетов для быстрого разгона
-		}
-
-		offTarget := float64(targetDelay) - float64(queuingDelay)
-		windowFactor := float64(maxPayloadSize) / float64(c.cwnd)
-
-		// Адаптивный разгон: если окно маленькое (< 1000 пакетов) 
-		// и задержка почти нулевая, растем в 2 раза агрессивнее
-		currentGain := gain
-		if c.cwnd < 1000*1400 && queuingDelay < 50000 {
-			currentGain *= 2.0
-		}
-
-		// Если мы выше таргета (задержка большая), уменьшаем окно плавнее,
-		// чтобы не терять скорость на кратковременных всплесках
-		if offTarget < 0 {
-			currentGain = currentGain / 4.0
-		}
-
-		inc := currentGain * offTarget / float64(targetDelay) * windowFactor * float64(maxPayloadSize)
-
-		newCwnd := float64(c.cwnd) + inc
-		if newCwnd < 3000 {
-			newCwnd = 3000
-		}
-		if newCwnd > maxCwnd {
-			newCwnd = maxCwnd
-		}
-		c.cwnd = uint32(newCwnd)
-
-		// Раз в минуту сбрасываем minDelay для адаптации к изменению маршрута
-		if time.Since(c.lastDelayUpdate) > time.Minute {
-			c.minDelay = h.TimestampDiff
-			c.lastDelayUpdate = time.Now()
-		}
+		c.cwnd = uint32(targetCwnd)
 	}
 
 	for _, ext := range h.Extensions {
@@ -583,7 +622,6 @@ func (c *Conn) waitAck(seq uint16) {
 		return
 	}
 	missinggo.WaitEvents(&mu, &send.acked, &c.destroyed)
-	return
 }
 
 // Waits for sent SYN to be ACKed. Returns any errors.
@@ -605,7 +643,6 @@ func (c *Conn) writeFin() {
 	}
 	c.write(stFin, c.send_id, nil, c.seq_nr)
 	c.wroteFin.Set()
-	return
 }
 
 func (c *Conn) destroy(reason error) {
