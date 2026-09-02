@@ -12,10 +12,15 @@ import (
 	"github.com/anacrolix/missinggo"
 )
 
-// BBR constants
+// BBR constants for congestion control
 const (
-	bbrCwndGain  = 2.0  // BBR cwnd gain (like cwnd_gain in BBR)
-	bbrRttWindow = 10   // 10 seconds for RTprop window
+	bbrRttWindow    = 10    // 10 seconds for RTprop window
+	btlbwWindowLen  = 10    // 10 RTT for BtlBw window
+	bbrCwndGain     = 2.0   // BBR cwnd gain
+	bbrMinCwnd      = 3000  // Minimum cwnd (~2 packets)
+	bbrInitCwnd     = 28000 // Initial cwnd for fast ramp-up (~20 packets)
+	bbrPacingGain   = 1.25  // Pacing gain > 1 to probe bandwidth
+	bbrMinPacingBw  = 50000 // Minimum bandwidth (bytes/sec) to enable pacing
 )
 
 // Conn is a uTP stream and implements net.Conn. It owned by a Socket, which
@@ -65,10 +70,14 @@ type Conn struct {
 	rtpropMin            uint32     // Minimum RTT observed (microseconds)
 	rtpropExpire        time.Time  // When to reset rtpropMin (10 sec window)
 	btlbwMax            float64    // Maximum bandwidth observed (bytes/sec)
+	btlbwSampleCount    int        // RTT count for BtlBw window (resets every 10 RTT)
+	bytesDelivered      uint32     // Bytes acked since last delivery rate measurement
 	lastDeliveryTime    time.Time  // Last ACK arrival time for delivery rate
 	lastDelivered       uint32     // Bytes acked since last measurement
 	deliverySampleCount int        // Count of delivery rate samples for BtlBw window
 	packetSize         uint32     // Average packet size for rate estimation
+	lastSendTime       time.Time  // Last send time for pacing
+	pacingInterval     time.Duration // Calculated pacing interval
 
 	// We need to send state packet.
 	pendingSendState              bool
@@ -295,6 +304,7 @@ func (c *Conn) ack(nr uint16) {
 	latency, first := s.Ack()
 	if first {
 		c.cur_window -= s.payloadSize
+		c.bytesDelivered += s.payloadSize // BBR: track delivered bytes for rate calculation
 		c.updateCanWrite()
 		c.addLatency(latency)
 	}
@@ -448,19 +458,19 @@ func (c *Conn) applyAcks(h header) {
 
 	// Initialize BBR state on first RTT measurement
 	if c.cwnd == 0 {
-		c.cwnd = 14000 // Start with ~10 packets for fast ramp-up
+		c.cwnd = bbrInitCwnd // Start with ~20 packets for fast ramp-up
 	}
 	if c.rtpropExpire.IsZero() {
 		c.rtpropExpire = time.Now().Add(time.Duration(bbrRttWindow) * time.Second)
 	}
 
 	// Update rtprop_min (minimum RTT) with 10-second window
+	// Adaptive reset: if RTT improves significantly, reset early
 	if rtt > 0 {
 		if c.rtpropMin == 0 || rtt < c.rtpropMin {
 			c.rtpropMin = rtt
-		}
-		// Reset rtprop_min every 10 seconds to adapt to route changes
-		if time.Now().After(c.rtpropExpire) {
+		} else if time.Now().After(c.rtpropExpire) {
+			// Standard timeout-based reset
 			c.rtpropMin = rtt
 			c.rtpropExpire = time.Now().Add(time.Duration(bbrRttWindow) * time.Second)
 		}
@@ -468,35 +478,39 @@ func (c *Conn) applyAcks(h header) {
 
 	// Calculate delivery rate (BBR-style)
 	now := time.Now()
-	bytesAcked := c.cur_window // Approximate bytes acknowledged
 	if c.lastDeliveryTime.IsZero() {
 		c.lastDeliveryTime = now
-		c.lastDelivered = 0
 	} else {
 		elapsed := now.Sub(c.lastDeliveryTime)
-		if elapsed > 0 {
-			// Current delivery rate: bytes / time
-			currentRate := float64(bytesAcked) / elapsed.Seconds()
+		if elapsed > 0 && c.bytesDelivered > 0 {
+			// Current delivery rate: bytes delivered / elapsed time
+			currentRate := float64(c.bytesDelivered) / elapsed.Seconds()
 
-			// Update average packet size
-			if c.packetSize == 0 && bytesAcked > 0 {
-				c.packetSize = bytesAcked
-			} else if bytesAcked > 0 {
-				c.packetSize = (c.packetSize + bytesAcked) / 2
+			// BBR: use MAX of observed rates, not EMA
+			if currentRate > c.btlbwMax {
+				c.btlbwMax = currentRate
 			}
 
-			// Use exponential moving average for smoother bandwidth estimate
-			if c.btlbwMax == 0 {
-				c.btlbwMax = currentRate
+			// Track RTT count for BtlBw window (every ACK = 1 RTT sample)
+			c.btlbwSampleCount++
+
+			// Reset BtlBw window every 10 RTT (reduce by 20% for cautious adaptation)
+			if c.btlbwSampleCount >= btlbwWindowLen {
+				c.btlbwMax = c.btlbwMax * 0.8
+				c.btlbwSampleCount = 0
+			}
+
+			// Update average packet size
+			if c.packetSize == 0 {
+				c.packetSize = c.bytesDelivered
 			} else {
-				// Weight recent measurement more heavily
-				c.btlbwMax = 0.7*c.btlbwMax + 0.3*currentRate
+				c.packetSize = (c.packetSize + c.bytesDelivered) / 2
 			}
 
 			c.deliverySampleCount++
-			c.lastDeliveryTime = now
-			c.lastDelivered = 0
 		}
+		c.lastDeliveryTime = now
+		c.bytesDelivered = 0 // Reset for next measurement window
 	}
 
 	// BBR-style cwnd calculation: cwnd = cwnd_gain * BtlBw * RTprop
@@ -507,14 +521,27 @@ func (c *Conn) applyAcks(h header) {
 
 		// Apply bounds
 		const maxCwnd = 4096 * 1400 // Match our max window
-		if targetCwnd < 3000 {
-			targetCwnd = 3000
+		if targetCwnd < bbrMinCwnd {
+			targetCwnd = bbrMinCwnd
 		}
 		if targetCwnd > maxCwnd {
 			targetCwnd = maxCwnd
 		}
 
 		c.cwnd = uint32(targetCwnd)
+
+		// Calculate pacing interval: pacing_rate = BtlBw * pacing_gain
+		// pacing_interval = packet_size / pacing_rate
+		// Only enable pacing when bandwidth exceeds minimum threshold
+		if c.btlbwMax > bbrMinPacingBw {
+			pacingRate := c.btlbwMax * bbrPacingGain
+			if pacingRate > 0 {
+				// pacing_interval in nanoseconds = bytes / (bytes/sec) * 1e9
+				c.pacingInterval = time.Duration(float64(maxPayloadSize) / pacingRate * float64(time.Second))
+			}
+		} else {
+			c.pacingInterval = 0 // Disable pacing at low bandwidth
+		}
 	}
 
 	for _, ext := range h.Extensions {
@@ -742,6 +769,15 @@ func (c *Conn) Write(p []byte) (n int, err error) {
 		// If peerWndSize is 0, we still want to send something, so don't
 		// block until we exceed it.
 		if c.canWrite.IsSet() {
+			// BBR pacing: wait if needed to maintain calculated interval
+			if c.pacingInterval > 0 && !c.lastSendTime.IsZero() {
+				elapsed := time.Since(c.lastSendTime)
+				if elapsed < c.pacingInterval {
+					time.Sleep(c.pacingInterval - elapsed)
+				}
+			}
+			c.lastSendTime = time.Now()
+
 			var n1 int
 			n1, err = c.write(stData, c.send_id, p, c.seq_nr)
 			n += n1
