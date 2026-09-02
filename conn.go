@@ -769,14 +769,14 @@ func (c *Conn) Write(p []byte) (n int, err error) {
 		// If peerWndSize is 0, we still want to send something, so don't
 		// block until we exceed it.
 		if c.canWrite.IsSet() {
-			// BBR pacing: wait if needed to maintain calculated interval
-			if c.pacingInterval > 0 && !c.lastSendTime.IsZero() {
-				elapsed := time.Since(c.lastSendTime)
-				if elapsed < c.pacingInterval {
-					time.Sleep(c.pacingInterval - elapsed)
-				}
-			}
-			c.lastSendTime = time.Now()
+			// BBR pacing disabled for testing
+			// if c.pacingInterval > 0 && !c.lastSendTime.IsZero() {
+			// 	elapsed := time.Since(c.lastSendTime)
+			// 	if elapsed < c.pacingInterval {
+			// 		time.Sleep(c.pacingInterval - elapsed)
+			// 	}
+			// }
+			// c.lastSendTime = time.Now()
 
 			var n1 int
 			n1, err = c.write(stData, c.send_id, p, c.seq_nr)
