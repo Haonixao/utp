@@ -133,3 +133,76 @@ func (me *selectiveAckBitmask) SetBit(index int) {
 func (me *selectiveAckBitmask) BitIsSet(index int) bool {
 	return me.Bytes[index/8]>>uint(index%8)&1 == 1
 }
+
+// selectiveAckRanges implements QUIC-style range-based selective ACK.
+// Format: [N (1 byte)][offset, length (2+2 bytes) x N]
+// Total max: 32 bytes (1 + 7 * 4)
+type selectiveAckRanges struct {
+	ranges [][2]uint16 // [offset, length] pairs relative to AckNr
+}
+
+const maxSackRanges = 7
+
+// buildFromBitmask creates ranges from a bitmask (for compatibility/transition)
+func (me *selectiveAckRanges) buildFromBitmask(bitmask selectiveAckBitmask) {
+	me.ranges = nil
+	var currentOffset uint16
+	var currentLength uint16
+
+	for i := 0; i < bitmask.NumBits(); i++ {
+		if bitmask.BitIsSet(i) {
+			if currentLength == 0 {
+				currentOffset = uint16(i)
+				currentLength = 1
+			} else {
+				currentLength++
+			}
+		} else if currentLength > 0 {
+			me.ranges = append(me.ranges, [2]uint16{currentOffset, currentLength})
+			currentLength = 0
+		}
+	}
+
+	if currentLength > 0 {
+		me.ranges = append(me.ranges, [2]uint16{currentOffset, currentLength})
+	}
+}
+
+// Marshal encodes ranges into bytes (always 32 bytes = 256 bits)
+// This maintains protocol compatibility with standard BitTorrent uTP
+// Format: [N (1 byte)][offset, length (2+2 bytes) x N][padding to 32]
+func (me *selectiveAckRanges) Marshal() []byte {
+	numRanges := len(me.ranges)
+	if numRanges > maxSackRanges {
+		numRanges = maxSackRanges
+	}
+	result := make([]byte, 32) // Always 32 bytes
+	result[0] = byte(numRanges)
+	for i := 0; i < numRanges; i++ {
+		binary.BigEndian.PutUint16(result[1+i*4:], me.ranges[i][0])
+		binary.BigEndian.PutUint16(result[3+i*4:], me.ranges[i][1])
+	}
+	return result
+}
+
+// NumPackets returns total number of packets covered by all ranges
+func (me *selectiveAckRanges) NumPackets() int {
+	total := 0
+	for _, r := range me.ranges {
+		total += int(r[1])
+	}
+	return total
+}
+
+// Range returns offset and length for range i
+func (me *selectiveAckRanges) Range(i int) (offset, length uint16) {
+	if i >= 0 && i < len(me.ranges) {
+		return me.ranges[i][0], me.ranges[i][1]
+	}
+	return 0, 0
+}
+
+// NumRanges returns the number of ranges
+func (me *selectiveAckRanges) NumRanges() int {
+	return len(me.ranges)
+}

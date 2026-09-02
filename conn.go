@@ -1,6 +1,7 @@
 package utp
 
 import (
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -121,22 +122,23 @@ func (c *Conn) makePacket(_type st, connID, seqNr uint16, payload []byte) (p []b
 		TimestampDiff: c.lastTimeDiff,
 	}
 	if len(selAck.Bytes) != 0 {
-		// Ограничиваем размер маски Selective ACK, чтобы заголовок не превышал maxHeaderSize.
-		// Это необходимо, так как мы увеличили maxUnackedInbound до 4096, но хотим сохранить
-		// совместимый размер заголовка.
-		maxSelAckBytes := ((256+7)/8 + 3) / 4 * 4
-		if len(selAck.Bytes) > maxSelAckBytes {
-			selAck.Bytes = selAck.Bytes[:maxSelAckBytes]
-		}
+		// Convert bitmask to ranges for more efficient encoding.
+		// 32 bytes (256 bits) bitmask → can describe 7 ranges covering 458K+ packets.
+		var ranges selectiveAckRanges
+		ranges.buildFromBitmask(selAck)
+
+		// Encode ranges into the SACK extension.
+		// Format: [N][offset,length x N] - max 32 bytes.
+		sackBytes := ranges.Marshal()
 
 		// The spec requires the number of bytes for a selective ACK to be at
 		// least 4, and a multiple of 4.
-		if len(selAck.Bytes)%4 != 0 {
-			panic(len(selAck.Bytes))
+		if len(sackBytes)%4 != 0 {
+			panic(len(sackBytes))
 		}
 		h.Extensions = append(h.Extensions, extensionField{
 			Type:  extensionTypeSelectiveAck,
-			Bytes: selAck.Bytes,
+			Bytes: sackBytes,
 		})
 	}
 	p = sendBufferPool.Get().([]byte)[:0:minMTU]
@@ -336,29 +338,10 @@ func (c *Conn) ackSkipped(seqNr uint16) {
 	}
 	switch send.acksSkipped {
 	case 3:
-		// Первый признак пропуска - режем осторожно (на 15%)
-		// и не чаще чем раз в один пинг (RTT)
-		if time.Since(c.lastDecrease) > c.latency() {
-			if c.cwnd > 14000 {
-				c.cwnd = uint32(float64(c.cwnd) * 0.85)
-				c.updateCanWrite()
-			}
-			c.lastDecrease = time.Now()
-		}
-
 		ackSkippedResends.Add(1)
 		send.resend()
 		send.resendTimer.Reset(c.resendTimeout() * time.Duration(send.numResends))
 	case 60:
-		// Если пакет потерян окончательно - режем сильнее (на 30%)
-		if time.Since(c.lastDecrease) > c.latency()/2 {
-			if c.cwnd > 14000 {
-				c.cwnd = uint32(float64(c.cwnd) * 0.7)
-				c.updateCanWrite()
-			}
-			c.lastDecrease = time.Now()
-		}
-
 		ackSkippedResends.Add(1)
 		send.resend()
 		send.resendTimer.Reset(c.resendTimeout() * time.Duration(send.numResends))
@@ -498,15 +481,65 @@ func (c *Conn) applyAcks(h header) {
 	for _, ext := range h.Extensions {
 		switch ext.Type {
 		case extensionTypeSelectiveAck:
+			// Parse range-based SACK: [N][offset,length x N]
+			if len(ext.Bytes) < 5 {
+				// Minimum valid: 1 byte N + 1 range (4 bytes)
+				break
+			}
+			numRanges := int(ext.Bytes[0])
+			if numRanges > maxSackRanges {
+				numRanges = maxSackRanges
+			}
+
+			// Track the highest packet position we've seen to limit processing
+			var maxPosition uint32
+
+			// First, call ackSkipped for packet AckNr+1 (same as original)
 			c.ackSkipped(h.AckNr + 1)
-			bitmask := selectiveAckBitmask{ext.Bytes}
-			for i := 0; i < bitmask.NumBits(); i++ {
-				if bitmask.BitIsSet(i) {
-					nr := h.AckNr + 2 + uint16(i)
-					// log.Printf("selectively acked %d", nr)
+
+			// Process each range
+			var prevEnd uint32
+
+			for i := 0; i < numRanges; i++ {
+				offset := binary.BigEndian.Uint16(ext.Bytes[1+i*4:])
+				length := binary.BigEndian.Uint16(ext.Bytes[3+i*4:])
+
+				if length == 0 {
+					continue
+				}
+
+				offsetU32 := uint32(offset)
+				lengthU32 := uint32(length)
+
+				// Handle gap between previous range end and this range start
+				if i == 0 && offset > 0 {
+					// Gap from AckNr+2 to first range start (offset positions after AckNr+1)
+					for j := uint32(0); j < offsetU32; j++ {
+						if h.AckNr+2+uint16(j) == 0 {
+							// Overflow check
+							break
+						}
+						c.ackSkipped(h.AckNr + 2 + uint16(j))
+					}
+				} else if i > 0 {
+					// Gap between ranges
+					for j := prevEnd; j < offsetU32; j++ {
+						if h.AckNr+2+uint16(j) == 0 {
+							break
+						}
+						c.ackSkipped(h.AckNr + 2 + uint16(j))
+					}
+				}
+
+				// Ack all packets in this range
+				for j := uint32(0); j < lengthU32; j++ {
+					nr := h.AckNr + 2 + offset + uint16(j)
 					c.ack(nr)
-				} else {
-					c.ackSkipped(h.AckNr + 2 + uint16(i))
+				}
+
+				prevEnd = offsetU32 + lengthU32
+				if offsetU32+lengthU32 > maxPosition {
+					maxPosition = offsetU32 + lengthU32
 				}
 			}
 		}
