@@ -16,7 +16,7 @@ import (
 const (
 	bbrRttWindow    = 10    // 10 seconds for RTprop window
 	btlbwWindowLen  = 10    // 10 RTT for BtlBw window
-	bbrCwndGain     = 2.0   // BBR cwnd gain
+	bbrCwndGain     = 1.5   // BBR cwnd gain (reduced from 2.0 for stability)
 	bbrMinCwnd      = 3000  // Minimum cwnd (~2 packets)
 	bbrInitCwnd     = 28000 // Initial cwnd for fast ramp-up (~20 packets)
 	bbrPacingGain   = 1.25  // Pacing gain > 1 to probe bandwidth
@@ -67,17 +67,15 @@ type Conn struct {
 	lastDecrease    time.Time
 
 	// BBR-style state
-	rtpropMin            uint32     // Minimum RTT observed (microseconds)
-	rtpropExpire        time.Time  // When to reset rtpropMin (10 sec window)
-	btlbwMax            float64    // Maximum bandwidth observed (bytes/sec)
-	btlbwSampleCount    int        // RTT count for BtlBw window (resets every 10 RTT)
-	bytesDelivered      uint32     // Bytes acked since last delivery rate measurement
-	lastDeliveryTime    time.Time  // Last ACK arrival time for delivery rate
-	lastDelivered       uint32     // Bytes acked since last measurement
-	deliverySampleCount int        // Count of delivery rate samples for BtlBw window
-	packetSize         uint32     // Average packet size for rate estimation
-	lastSendTime       time.Time  // Last send time for pacing
-	pacingInterval     time.Duration // Calculated pacing interval
+	rtpropMin        uint32    // Minimum RTT observed (microseconds)
+	rtpropExpire     time.Time // When to reset rtpropMin (10 sec window)
+	btlbwMax         float64   // Maximum bandwidth observed (bytes/sec)
+	btlbwExpire      time.Time // When to reset btlbwMax (10 RTT window)
+	totalDelivered   uint32    // Cumulative bytes delivered
+	lastDeliveryTime time.Time // Last delivery event time
+	packetSize       uint32    // Average packet size for rate estimation
+	lastSendTime     time.Time // Last send time for pacing
+	pacingInterval   time.Duration // Calculated pacing interval
 
 	// We need to send state packet.
 	pendingSendState              bool
@@ -238,6 +236,7 @@ func (c *Conn) write(_type st, connID uint16, payload []byte, seqNr uint16) (n i
 		return
 	}
 	n = len(payload)
+	c.lastSendTime = time.Now()
 	// Copy payload so caller to write can continue to use the buffer.
 	if payload != nil {
 		payload = append(sendBufferPool.Get().([]byte)[:0:minMTU], payload...)
@@ -250,6 +249,11 @@ func (c *Conn) write(_type st, connID uint16, payload []byte, seqNr uint16) (n i
 		payload:     payload,
 		seqNr:       seqNr,
 		conn:        c,
+		delivered:   c.totalDelivered,
+		deliveredAt: c.lastDeliveryTime,
+	}
+	if send.deliveredAt.IsZero() {
+		send.deliveredAt = time.Now()
 	}
 	send.resendTimer = time.AfterFunc(c.resendTimeout(), send.timeoutResend)
 	c.unackedSends = append(c.unackedSends, send)
@@ -288,7 +292,7 @@ func (c *Conn) addLatency(l time.Duration) {
 }
 
 // Ack our send with the given sequence number.
-func (c *Conn) ack(nr uint16) {
+func (c *Conn) ack(nr uint16, now time.Time, prevDeliveryTime time.Time) {
 	if !seqLess(c.lastAck, nr) {
 		// Already acked.
 		return
@@ -304,7 +308,35 @@ func (c *Conn) ack(nr uint16) {
 	latency, first := s.Ack()
 	if first {
 		c.cur_window -= s.payloadSize
-		c.bytesDelivered += s.payloadSize // BBR: track delivered bytes for rate calculation
+
+		// BBR: Delivery Rate calculation
+		c.totalDelivered += s.payloadSize
+		if !s.deliveredAt.IsZero() {
+			delivered := c.totalDelivered - s.delivered
+			// Use max of (now - packet.deliveredAt) and (now - prevDeliveryTime) to handle ACK compression
+			elapsed := now.Sub(s.deliveredAt)
+			if !prevDeliveryTime.IsZero() {
+				elapsedAck := now.Sub(prevDeliveryTime)
+				if elapsedAck > elapsed {
+					elapsed = elapsedAck
+				}
+			}
+
+			if elapsed > 0 {
+				currentRate := float64(delivered) / elapsed.Seconds()
+				// Time-based max filter for BtlBw (10 RTT window)
+				if currentRate > c.btlbwMax || now.After(c.btlbwExpire) {
+					c.btlbwMax = currentRate
+					// Set expiration to 10 RTTs. Default to 1s if RTT is unknown.
+					window := time.Second
+					if c.rtpropMin > 0 {
+						window = time.Duration(c.rtpropMin) * time.Microsecond * 10
+					}
+					c.btlbwExpire = now.Add(window)
+				}
+			}
+		}
+
 		c.updateCanWrite()
 		c.addLatency(latency)
 	}
@@ -321,12 +353,12 @@ func (c *Conn) ack(nr uint16) {
 	}
 }
 
-func (c *Conn) ackTo(nr uint16) {
+func (c *Conn) ackTo(nr uint16, now time.Time, prevDeliveryTime time.Time) {
 	if !seqLess(nr, c.seq_nr) {
 		return
 	}
 	for seqLess(c.lastAck, nr) {
-		c.ack(c.lastAck + 1)
+		c.ack(c.lastAck+1, now, prevDeliveryTime)
 	}
 }
 
@@ -451,7 +483,10 @@ func (c *Conn) processDelivery(h header, payload []byte) {
 }
 
 func (c *Conn) applyAcks(h header) {
-	c.ackTo(h.AckNr)
+	now := time.Now()
+	prevDeliveryTime := c.lastDeliveryTime
+
+	c.ackTo(h.AckNr, now, prevDeliveryTime)
 
 	// Calculate RTT from peer's timestamp
 	rtt := c.timestamp() - h.Timestamp
@@ -465,7 +500,6 @@ func (c *Conn) applyAcks(h header) {
 	}
 
 	// Update rtprop_min (minimum RTT) with 10-second window
-	// Adaptive reset: if RTT improves significantly, reset early
 	if rtt > 0 {
 		if c.rtpropMin == 0 || rtt < c.rtpropMin {
 			c.rtpropMin = rtt
@@ -476,45 +510,7 @@ func (c *Conn) applyAcks(h header) {
 		}
 	}
 
-	// Calculate delivery rate (BBR-style)
-	now := time.Now()
-	if c.lastDeliveryTime.IsZero() {
-		c.lastDeliveryTime = now
-	} else {
-		elapsed := now.Sub(c.lastDeliveryTime)
-		if elapsed > 0 && c.bytesDelivered > 0 {
-			// Current delivery rate: bytes delivered / elapsed time
-			currentRate := float64(c.bytesDelivered) / elapsed.Seconds()
-
-			// BBR: use MAX of observed rates, not EMA
-			if currentRate > c.btlbwMax {
-				c.btlbwMax = currentRate
-			}
-
-			// Track RTT count for BtlBw window (every ACK = 1 RTT sample)
-			c.btlbwSampleCount++
-
-			// Reset BtlBw window every 10 RTT (reduce by 20% for cautious adaptation)
-			if c.btlbwSampleCount >= btlbwWindowLen {
-				c.btlbwMax = c.btlbwMax * 0.8
-				c.btlbwSampleCount = 0
-			}
-
-			// Update average packet size
-			if c.packetSize == 0 {
-				c.packetSize = c.bytesDelivered
-			} else {
-				c.packetSize = (c.packetSize + c.bytesDelivered) / 2
-			}
-
-			c.deliverySampleCount++
-		}
-		c.lastDeliveryTime = now
-		c.bytesDelivered = 0 // Reset for next measurement window
-	}
-
 	// BBR-style cwnd calculation: cwnd = cwnd_gain * BtlBw * RTprop
-	// BtlBw is in bytes/sec, RTprop in seconds
 	if c.rtpropMin > 0 && c.btlbwMax > 0 {
 		rtpropSec := float64(c.rtpropMin) / 1e6 // Convert microseconds to seconds
 		targetCwnd := bbrCwndGain * c.btlbwMax * rtpropSec
@@ -531,16 +527,13 @@ func (c *Conn) applyAcks(h header) {
 		c.cwnd = uint32(targetCwnd)
 
 		// Calculate pacing interval: pacing_rate = BtlBw * pacing_gain
-		// pacing_interval = packet_size / pacing_rate
-		// Only enable pacing when bandwidth exceeds minimum threshold
 		if c.btlbwMax > bbrMinPacingBw {
 			pacingRate := c.btlbwMax * bbrPacingGain
 			if pacingRate > 0 {
-				// pacing_interval in nanoseconds = bytes / (bytes/sec) * 1e9
 				c.pacingInterval = time.Duration(float64(maxPayloadSize) / pacingRate * float64(time.Second))
 			}
 		} else {
-			c.pacingInterval = 0 // Disable pacing at low bandwidth
+			c.pacingInterval = 0
 		}
 	}
 
@@ -600,7 +593,7 @@ func (c *Conn) applyAcks(h header) {
 				// Ack all packets in this range
 				for j := uint32(0); j < lengthU32; j++ {
 					nr := h.AckNr + 2 + offset + uint16(j)
-					c.ack(nr)
+					c.ack(nr, now, prevDeliveryTime)
 				}
 
 				prevEnd = offsetU32 + lengthU32
@@ -610,6 +603,7 @@ func (c *Conn) applyAcks(h header) {
 			}
 		}
 	}
+	c.lastDeliveryTime = now
 }
 
 func (c *Conn) assertHeader(h header) {
@@ -769,14 +763,17 @@ func (c *Conn) Write(p []byte) (n int, err error) {
 		// If peerWndSize is 0, we still want to send something, so don't
 		// block until we exceed it.
 		if c.canWrite.IsSet() {
-			// BBR pacing disabled for testing
-			// if c.pacingInterval > 0 && !c.lastSendTime.IsZero() {
-			// 	elapsed := time.Since(c.lastSendTime)
-			// 	if elapsed < c.pacingInterval {
-			// 		time.Sleep(c.pacingInterval - elapsed)
-			// 	}
-			// }
-			// c.lastSendTime = time.Now()
+			// BBR Pacing: ensure we don't burst too many packets
+			if c.pacingInterval > 0 && !c.lastSendTime.IsZero() {
+				elapsed := time.Since(c.lastSendTime)
+				if elapsed < c.pacingInterval {
+					wait := c.pacingInterval - elapsed
+					mu.Unlock()
+					time.Sleep(wait)
+					mu.Lock()
+					continue // Re-check conditions after sleep
+				}
+			}
 
 			var n1 int
 			n1, err = c.write(stData, c.send_id, p, c.seq_nr)
