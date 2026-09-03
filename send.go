@@ -16,8 +16,6 @@ type send struct {
 	payload     []byte
 	seqNr       uint16
 	conn        *Conn
-	delivered   uint32
-	deliveredAt time.Time
 
 	acksSkipped int
 	resendTimer *time.Timer

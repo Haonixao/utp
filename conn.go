@@ -12,17 +12,6 @@ import (
 	"github.com/anacrolix/missinggo"
 )
 
-// BBR constants for congestion control
-const (
-	bbrRttWindow    = 10    // 10 seconds for RTprop window
-	btlbwWindowLen  = 10    // 10 RTT for BtlBw window
-	bbrCwndGain     = 1.5   // BBR cwnd gain (reduced from 2.0 for stability)
-	bbrMinCwnd      = 3000  // Minimum cwnd (~2 packets)
-	bbrInitCwnd     = 28000 // Initial cwnd for fast ramp-up (~20 packets)
-	bbrPacingGain   = 1.25  // Pacing gain > 1 to probe bandwidth
-	bbrMinPacingBw  = 50000 // Minimum bandwidth (bytes/sec) to enable pacing
-)
-
 // Conn is a uTP stream and implements net.Conn. It owned by a Socket, which
 // handles dispatching packets to and from Conns.
 type Conn struct {
@@ -65,17 +54,6 @@ type Conn struct {
 	minDelay        uint32
 	lastDelayUpdate time.Time
 	lastDecrease    time.Time
-
-	// BBR-style state
-	rtpropMin        uint32    // Minimum RTT observed (microseconds)
-	rtpropExpire     time.Time // When to reset rtpropMin (10 sec window)
-	btlbwMax         float64   // Maximum bandwidth observed (bytes/sec)
-	btlbwExpire      time.Time // When to reset btlbwMax (10 RTT window)
-	totalDelivered   uint32    // Cumulative bytes delivered
-	lastDeliveryTime time.Time // Last delivery event time
-	packetSize       uint32    // Average packet size for rate estimation
-	lastSendTime     time.Time // Last send time for pacing
-	pacingInterval   time.Duration // Calculated pacing interval
 
 	// We need to send state packet.
 	pendingSendState              bool
@@ -216,6 +194,7 @@ func (c *Conn) pendSendState() {
 
 func (me *Conn) writeSyn() {
 	me.write(stSyn, me.recv_id, nil, me.seq_nr)
+	return
 }
 
 func (c *Conn) write(_type st, connID uint16, payload []byte, seqNr uint16) (n int, err error) {
@@ -236,7 +215,6 @@ func (c *Conn) write(_type st, connID uint16, payload []byte, seqNr uint16) (n i
 		return
 	}
 	n = len(payload)
-	c.lastSendTime = time.Now()
 	// Copy payload so caller to write can continue to use the buffer.
 	if payload != nil {
 		payload = append(sendBufferPool.Get().([]byte)[:0:minMTU], payload...)
@@ -249,11 +227,6 @@ func (c *Conn) write(_type st, connID uint16, payload []byte, seqNr uint16) (n i
 		payload:     payload,
 		seqNr:       seqNr,
 		conn:        c,
-		delivered:   c.totalDelivered,
-		deliveredAt: c.lastDeliveryTime,
-	}
-	if send.deliveredAt.IsZero() {
-		send.deliveredAt = time.Now()
 	}
 	send.resendTimer = time.AfterFunc(c.resendTimeout(), send.timeoutResend)
 	c.unackedSends = append(c.unackedSends, send)
@@ -292,7 +265,7 @@ func (c *Conn) addLatency(l time.Duration) {
 }
 
 // Ack our send with the given sequence number.
-func (c *Conn) ack(nr uint16, now time.Time, prevDeliveryTime time.Time) {
+func (c *Conn) ack(nr uint16) {
 	if !seqLess(c.lastAck, nr) {
 		// Already acked.
 		return
@@ -308,35 +281,6 @@ func (c *Conn) ack(nr uint16, now time.Time, prevDeliveryTime time.Time) {
 	latency, first := s.Ack()
 	if first {
 		c.cur_window -= s.payloadSize
-
-		// BBR: Delivery Rate calculation
-		c.totalDelivered += s.payloadSize
-		if !s.deliveredAt.IsZero() {
-			delivered := c.totalDelivered - s.delivered
-			// Use max of (now - packet.deliveredAt) and (now - prevDeliveryTime) to handle ACK compression
-			elapsed := now.Sub(s.deliveredAt)
-			if !prevDeliveryTime.IsZero() {
-				elapsedAck := now.Sub(prevDeliveryTime)
-				if elapsedAck > elapsed {
-					elapsed = elapsedAck
-				}
-			}
-
-			if elapsed > 0 {
-				currentRate := float64(delivered) / elapsed.Seconds()
-				// Time-based max filter for BtlBw (10 RTT window)
-				if currentRate > c.btlbwMax || now.After(c.btlbwExpire) {
-					c.btlbwMax = currentRate
-					// Set expiration to 10 RTTs. Default to 1s if RTT is unknown.
-					window := time.Second
-					if c.rtpropMin > 0 {
-						window = time.Duration(c.rtpropMin) * time.Microsecond * 10
-					}
-					c.btlbwExpire = now.Add(window)
-				}
-			}
-		}
-
 		c.updateCanWrite()
 		c.addLatency(latency)
 	}
@@ -353,12 +297,12 @@ func (c *Conn) ack(nr uint16, now time.Time, prevDeliveryTime time.Time) {
 	}
 }
 
-func (c *Conn) ackTo(nr uint16, now time.Time, prevDeliveryTime time.Time) {
+func (c *Conn) ackTo(nr uint16) {
 	if !seqLess(nr, c.seq_nr) {
 		return
 	}
 	for seqLess(c.lastAck, nr) {
-		c.ack(c.lastAck+1, now, prevDeliveryTime)
+		c.ack(c.lastAck + 1)
 	}
 }
 
@@ -483,57 +427,54 @@ func (c *Conn) processDelivery(h header, payload []byte) {
 }
 
 func (c *Conn) applyAcks(h header) {
-	now := time.Now()
-	prevDeliveryTime := c.lastDeliveryTime
+	c.ackTo(h.AckNr)
 
-	c.ackTo(h.AckNr, now, prevDeliveryTime)
-
-	// Calculate RTT from peer's timestamp
-	rtt := c.timestamp() - h.Timestamp
-
-	// Initialize BBR state on first RTT measurement
-	if c.cwnd == 0 {
-		c.cwnd = bbrInitCwnd // Start with ~20 packets for fast ramp-up
-	}
-	if c.rtpropExpire.IsZero() {
-		c.rtpropExpire = time.Now().Add(time.Duration(bbrRttWindow) * time.Second)
-	}
-
-	// Update rtprop_min (minimum RTT) with 10-second window
-	if rtt > 0 {
-		if c.rtpropMin == 0 || rtt < c.rtpropMin {
-			c.rtpropMin = rtt
-		} else if time.Now().After(c.rtpropExpire) {
-			// Standard timeout-based reset
-			c.rtpropMin = rtt
-			c.rtpropExpire = time.Now().Add(time.Duration(bbrRttWindow) * time.Second)
-		}
-	}
-
-	// BBR-style cwnd calculation: cwnd = cwnd_gain * BtlBw * RTprop
-	if c.rtpropMin > 0 && c.btlbwMax > 0 {
-		rtpropSec := float64(c.rtpropMin) / 1e6 // Convert microseconds to seconds
-		targetCwnd := bbrCwndGain * c.btlbwMax * rtpropSec
-
-		// Apply bounds
-		const maxCwnd = 4096 * 1400 // Match our max window
-		if targetCwnd < bbrMinCwnd {
-			targetCwnd = bbrMinCwnd
-		}
-		if targetCwnd > maxCwnd {
-			targetCwnd = maxCwnd
+	// LEDBAT: Обновляем minDelay и cwnd на основе TimestampDiff
+	if h.TimestampDiff != 0 {
+		if c.minDelay == 0 || h.TimestampDiff < c.minDelay {
+			c.minDelay = h.TimestampDiff
 		}
 
-		c.cwnd = uint32(targetCwnd)
+		queuingDelay := h.TimestampDiff - c.minDelay
+		const targetDelay = 400000 // 400ms - "Бесстрашный" таргет (был 250ms)
+		const gain = 4.0           // Максимальный напор (был 2.0)
+		const maxCwnd = 4096 * 1400 // Соответствует новому лимиту в utp.go
 
-		// Calculate pacing interval: pacing_rate = BtlBw * pacing_gain
-		if c.btlbwMax > bbrMinPacingBw {
-			pacingRate := c.btlbwMax * bbrPacingGain
-			if pacingRate > 0 {
-				c.pacingInterval = time.Duration(float64(maxPayloadSize) / pacingRate * float64(time.Second))
-			}
-		} else {
-			c.pacingInterval = 0
+		if c.cwnd == 0 {
+			c.cwnd = 14000 // Стартуем сразу с 10 пакетов для быстрого разгона
+		}
+
+		offTarget := float64(targetDelay) - float64(queuingDelay)
+		windowFactor := float64(maxPayloadSize) / float64(c.cwnd)
+
+		// Адаптивный разгон: если окно маленькое (< 1000 пакетов) 
+		// и задержка почти нулевая, растем в 2 раза агрессивнее
+		currentGain := gain
+		if c.cwnd < 1000*1400 && queuingDelay < 50000 {
+			currentGain *= 2.0
+		}
+
+		// Если мы выше таргета (задержка большая), уменьшаем окно плавнее,
+		// чтобы не терять скорость на кратковременных всплесках
+		if offTarget < 0 {
+			currentGain = currentGain / 4.0
+		}
+
+		inc := currentGain * offTarget / float64(targetDelay) * windowFactor * float64(maxPayloadSize)
+
+		newCwnd := float64(c.cwnd) + inc
+		if newCwnd < 3000 {
+			newCwnd = 3000
+		}
+		if newCwnd > maxCwnd {
+			newCwnd = maxCwnd
+		}
+		c.cwnd = uint32(newCwnd)
+
+		// Раз в минуту сбрасываем minDelay для адаптации к изменению маршрута
+		if time.Since(c.lastDelayUpdate) > time.Minute {
+			c.minDelay = h.TimestampDiff
+			c.lastDelayUpdate = time.Now()
 		}
 	}
 
@@ -593,7 +534,7 @@ func (c *Conn) applyAcks(h header) {
 				// Ack all packets in this range
 				for j := uint32(0); j < lengthU32; j++ {
 					nr := h.AckNr + 2 + offset + uint16(j)
-					c.ack(nr, now, prevDeliveryTime)
+					c.ack(nr)
 				}
 
 				prevEnd = offsetU32 + lengthU32
@@ -603,7 +544,6 @@ func (c *Conn) applyAcks(h header) {
 			}
 		}
 	}
-	c.lastDeliveryTime = now
 }
 
 func (c *Conn) assertHeader(h header) {
@@ -643,6 +583,7 @@ func (c *Conn) waitAck(seq uint16) {
 		return
 	}
 	missinggo.WaitEvents(&mu, &send.acked, &c.destroyed)
+	return
 }
 
 // Waits for sent SYN to be ACKed. Returns any errors.
@@ -664,6 +605,7 @@ func (c *Conn) writeFin() {
 	}
 	c.write(stFin, c.send_id, nil, c.seq_nr)
 	c.wroteFin.Set()
+	return
 }
 
 func (c *Conn) destroy(reason error) {
@@ -763,18 +705,6 @@ func (c *Conn) Write(p []byte) (n int, err error) {
 		// If peerWndSize is 0, we still want to send something, so don't
 		// block until we exceed it.
 		if c.canWrite.IsSet() {
-			// BBR Pacing: ensure we don't burst too many packets
-			if c.pacingInterval > 0 && !c.lastSendTime.IsZero() {
-				elapsed := time.Since(c.lastSendTime)
-				if elapsed < c.pacingInterval {
-					wait := c.pacingInterval - elapsed
-					mu.Unlock()
-					time.Sleep(wait)
-					mu.Lock()
-					continue // Re-check conditions after sleep
-				}
-			}
-
 			var n1 int
 			n1, err = c.write(stData, c.send_id, p, c.seq_nr)
 			n += n1
