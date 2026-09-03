@@ -50,10 +50,12 @@ type Conn struct {
 	latencies []time.Duration
 
 	// LEDBAT / Congestion Control
-	cwnd            uint32
-	minDelay        uint32
-	lastDelayUpdate time.Time
-	lastDecrease    time.Time
+	cwnd             uint32
+	minDelay         uint32
+	minDelaySaved    uint32 // minDelay после уменьшения для разгрузки канала
+	minDelayPromised uint32 // Значение для возврата если уменьшение не помогло
+	lastDelayUpdate  time.Time
+	lastDecrease     time.Time
 
 	// We need to send state packet.
 	pendingSendState              bool
@@ -66,9 +68,7 @@ type Conn struct {
 	packetReadTimeoutTimer *time.Timer
 }
 
-var (
-	_ net.Conn = &Conn{}
-)
+var _ net.Conn = &Conn{}
 
 func (c *Conn) age() time.Duration {
 	return time.Since(c.created)
@@ -194,7 +194,6 @@ func (c *Conn) pendSendState() {
 
 func (me *Conn) writeSyn() {
 	me.write(stSyn, me.recv_id, nil, me.seq_nr)
-	return
 }
 
 func (c *Conn) write(_type st, connID uint16, payload []byte, seqNr uint16) (n int, err error) {
@@ -431,13 +430,33 @@ func (c *Conn) applyAcks(h header) {
 
 	// LEDBAT: Обновляем minDelay и cwnd на основе TimestampDiff
 	if h.TimestampDiff != 0 {
+
 		if c.minDelay == 0 || h.TimestampDiff < c.minDelay {
 			c.minDelay = h.TimestampDiff
 		}
 
+		// Корректировка через 2 секунды: если promised > 0 и прошло 2 сек
+		if c.minDelayPromised > 0 && time.Since(c.lastDelayUpdate) > 2*time.Second {
+			if c.minDelay == c.minDelaySaved {
+				c.minDelay = c.minDelayPromised
+			}
+			// Сбрасываем promised независимо от условия
+			c.minDelayPromised = 0
+			c.lastDelayUpdate = time.Now()
+		}
+
+		// Корректировка через 5 секунд если увеличилась задержка
+		if time.Since(c.lastDelayUpdate) > 5*time.Second && h.TimestampDiff > c.minDelay {
+			// Уменьшаем minDelay на 30% для разгрузки канала
+			c.minDelaySaved = c.minDelay * 70 / 100
+			c.minDelayPromised = h.TimestampDiff
+			c.minDelay = c.minDelaySaved
+			c.lastDelayUpdate = time.Now()
+		}
+
 		queuingDelay := h.TimestampDiff - c.minDelay
-		const targetDelay = 400000 // 400ms - "Бесстрашный" таргет (был 250ms)
-		const gain = 4.0           // Максимальный напор (был 2.0)
+		const targetDelay = 400000  // 400ms - "Бесстрашный" таргет (был 250ms)
+		const gain = 4.0            // Максимальный напор (был 2.0)
 		const maxCwnd = 4096 * 1400 // Соответствует новому лимиту в utp.go
 
 		if c.cwnd == 0 {
@@ -447,7 +466,7 @@ func (c *Conn) applyAcks(h header) {
 		offTarget := float64(targetDelay) - float64(queuingDelay)
 		windowFactor := float64(maxPayloadSize) / float64(c.cwnd)
 
-		// Адаптивный разгон: если окно маленькое (< 1000 пакетов) 
+		// Адаптивный разгон: если окно маленькое (< 1000 пакетов)
 		// и задержка почти нулевая, растем в 2 раза агрессивнее
 		currentGain := gain
 		if c.cwnd < 1000*1400 && queuingDelay < 50000 {
@@ -462,6 +481,11 @@ func (c *Conn) applyAcks(h header) {
 
 		inc := currentGain * offTarget / float64(targetDelay) * windowFactor * float64(maxPayloadSize)
 
+		// Асимметрия: падение окна в 2 раза медленнее роста
+		if offTarget < 0 {
+			inc *= 0.5
+		}
+
 		newCwnd := float64(c.cwnd) + inc
 		if newCwnd < 3000 {
 			newCwnd = 3000
@@ -470,12 +494,6 @@ func (c *Conn) applyAcks(h header) {
 			newCwnd = maxCwnd
 		}
 		c.cwnd = uint32(newCwnd)
-
-		// Раз в минуту сбрасываем minDelay для адаптации к изменению маршрута
-		if time.Since(c.lastDelayUpdate) > time.Minute {
-			c.minDelay = h.TimestampDiff
-			c.lastDelayUpdate = time.Now()
-		}
 	}
 
 	for _, ext := range h.Extensions {
@@ -583,7 +601,6 @@ func (c *Conn) waitAck(seq uint16) {
 		return
 	}
 	missinggo.WaitEvents(&mu, &send.acked, &c.destroyed)
-	return
 }
 
 // Waits for sent SYN to be ACKed. Returns any errors.
@@ -605,7 +622,6 @@ func (c *Conn) writeFin() {
 	}
 	c.write(stFin, c.send_id, nil, c.seq_nr)
 	c.wroteFin.Set()
-	return
 }
 
 func (c *Conn) destroy(reason error) {
